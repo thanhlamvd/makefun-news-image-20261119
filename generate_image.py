@@ -1,42 +1,137 @@
 #!/usr/bin/env python3
-"""Render the news image for Thursday 19 November 2026.
+"""Draw the 19 November 2026 front page as a 1024x1024 PNG.
 
-Build-time script (runs on the author's machine, not in the grader):
-draws a 1024x1024 newspaper front page to entry.png from the six
-verified stories below. Each story happened on, or was reported on,
-19 November 2026, as carried by Reuters, AP, AFP, BBC, TechCrunch and
-PTI (via the day's briefings that collected them). The entry itself is
-main.py, which only copies entry.png to /output/entry.png —
-deterministic, stdlib-only, no network.
+Pure standard library: a small framebuffer, a 5x7 bitmap font and a
+minimal PNG writer built on zlib. No network, no clock, no randomness,
+so the output bytes are identical on every run. Usage:
+    python3 generate_image.py [output.png]
+With no argument the image goes to generated.png next to this file.
+This is a build-time tool only: the entry itself is main.py, which
+copies the committed entry.png, so this file never overwrites it.
 """
+import binascii
+import os
+import struct
+import sys
+import zlib
 
-from PIL import Image, ImageDraw, ImageFont
+WIDTH = 1024
+HEIGHT = 1024
 
-W = H = 1024
-PAPER = (247, 243, 234)       # newsprint
-NAVY = (18, 30, 58)
-GOLD = (212, 175, 105)
-INK = (26, 26, 26)
-BODY_INK = (62, 62, 62)
-GREY = (92, 92, 92)
-CARD = (255, 255, 255)
-RULE = (198, 190, 172)
+# 5x7 bitmap font, caps only. Each glyph is 7 rows of 5 cells,
+# '#' = ink, '.' = blank. The front page is set entirely in caps,
+# so no lowercase glyphs are needed.
+FONT = {
+    "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
+    "C": (".####", "#....", "#....", "#....", "#....", "#....", ".####"),
+    "D": ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
+    "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
+    "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
+    "G": (".####", "#....", "#....", "#..##", "#...#", "#...#", ".###."),
+    "H": ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    "I": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####"),
+    "J": ("..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."),
+    "K": ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
+    "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
+    "M": ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
+    "N": ("#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"),
+    "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "P": ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
+    "Q": (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
+    "R": ("####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"),
+    "S": (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
+    "T": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
+    "U": ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "V": ("#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
+    "W": ("#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#"),
+    "X": ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
+    "Y": ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
+    "Z": ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
+    "0": (".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."),
+    "1": ("..#..", ".##..", "#.#..", "..#..", "..#..", "..#..", ".###."),
+    "2": (".###.", "#...#", "....#", "..##.", ".#...", "#....", "#####"),
+    "3": ("####.", "....#", "....#", ".###.", "....#", "....#", "####."),
+    "4": ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
+    "5": ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
+    "6": (".###.", "#....", "#....", "####.", "#...#", "#...#", ".###."),
+    "7": ("#####", "....#", "...#.", "..#..", "..#..", ".#...", ".#..."),
+    "8": (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
+    "9": (".###.", "#...#", "#...#", ".####", "....#", "....#", ".###."),
+    " ": (".....", ".....", ".....", ".....", ".....", ".....", "....."),
+    ",": (".....", ".....", ".....", ".....", "..##.", "..##.", ".#..."),
+    ".": (".....", ".....", ".....", ".....", ".....", ".##..", ".##.."),
+    ":": (".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."),
+    ";": (".....", ".##..", ".##..", ".....", ".##..", ".##..", ".#..."),
+    "'": ("..#..", "..#..", ".#...", ".....", ".....", ".....", "....."),
+    "-": (".....", ".....", ".....", ".###.", ".....", ".....", "....."),
+    "/": ("....#", "...#.", "...#.", "..#..", ".#...", ".#...", "#...."),
+    "&": (".##..", "#..#.", "#..#.", ".#...", "#.#.#", "#..#.", ".##.#"),
+    "(": ("...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."),
+    ")": (".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."),
+    "%": ("##..#", "##.#.", "...#.", "..#..", ".#...", "#.#.#", "#..##"),
+    "$": ("..#..", ".####", "#.#..", ".###.", "..#.#", "####.", "..#.."),
+    "?": (".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."),
+}
 
-SERIF_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
-SANS_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+def new_canvas(width, height, color):
+    return bytearray(bytes(color) * (width * height))
 
 
-def font(path, size):
-    return ImageFont.truetype(path, size)
+def fill(buf, width, x, y, w, h, color):
+    r, g, b = color
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(width, x + w)
+    y1 = min(HEIGHT, y + h)
+    for yy in range(y0, y1):
+        base = (yy * width + x0) * 3
+        for xx in range(x0, x1):
+            o = base + (xx - x0) * 3
+            buf[o] = r
+            buf[o + 1] = g
+            buf[o + 2] = b
 
 
-def wrap(draw, text, fnt, width):
-    """Greedy word wrap to pixel width."""
-    lines, cur = [], ""
-    for word in text.split():
-        trial = (cur + " " + word).strip()
-        if draw.textlength(trial, font=fnt) <= width:
+def border(buf, width, x, y, w, h, color, thick=2):
+    fill(buf, width, x, y, w, thick, color)
+    fill(buf, width, x, y + h - thick, w, thick, color)
+    fill(buf, width, x, y, thick, h, color)
+    fill(buf, width, x + w - thick, y, thick, h, color)
+
+
+def draw_glyph(buf, width, x, y, ch, color, scale):
+    glyph = FONT.get(ch, FONT["?"])
+    for row in range(7):
+        for col in range(5):
+            if glyph[row][col] == "#":
+                fill(buf, width, x + col * scale, y + row * scale,
+                     scale, scale, color)
+
+
+def text_width(text, scale):
+    return len(text) * 6 * scale
+
+
+def draw_text(buf, width, x, y, text, color, scale):
+    cx = x
+    for ch in text:
+        draw_glyph(buf, width, cx, y, ch, color, scale)
+        cx += 6 * scale
+
+
+def draw_centred(buf, width, y, text, color, scale):
+    draw_text(buf, width, (width - text_width(text, scale)) // 2,
+              y, text, color, scale)
+
+
+def wrap(text, max_chars):
+    lines = []
+    cur = ""
+    for word in text.split(" "):
+        trial = word if not cur else cur + " " + word
+        if len(trial) <= max_chars:
             cur = trial
         else:
             if cur:
@@ -47,155 +142,137 @@ def wrap(draw, text, fnt, width):
     return lines
 
 
-# (tag, tag colour, headline, summary, icon)
+def draw_wrapped(buf, width, x, y, text, color, scale, max_chars, line_h):
+    lines = wrap(text, max_chars)
+    for i, line in enumerate(lines):
+        draw_text(buf, width, x, y + i * line_h, line, color, scale)
+    return y + len(lines) * line_h
+
+
+def _chunk(kind, data):
+    out = struct.pack(">I", len(data)) + kind + data
+    return out + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
+
+
+def write_png(path, width, height, buf):
+    raw = b"".join(
+        b"\x00" + bytes(buf[y * width * 3:(y + 1) * width * 3])
+        for y in range(height)
+    )
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _chunk(b"IHDR", ihdr)
+    png += _chunk(b"IDAT", zlib.compress(raw, 9))
+    png += _chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+PAPER = (251, 248, 241)
+CARD = (255, 255, 255)
+INK = (24, 24, 32)
+NAVY = (17, 24, 39)
+GOLD = (201, 162, 39)
+GREY = (100, 116, 139)
+LINE = (203, 213, 225)
+WHITE = (255, 255, 255)
+
 STORIES = [
-    ("DIPLOMACY", (27, 94, 143),
-     "Trump, Xi and Putin meet in Shenzhen",
-     "The three leaders hold the first US\u2013China\u2013Russia summit "
-     "at APEC, talking nuclear risks, Ukraine and Iran.",
-     "flags"),
-    ("JUSTICE", (106, 76, 147),
-     "UN court: Myanmar committed genocide",
-     "The ICJ rules 9\u20136 that the 2017 crackdown on the Rohingya "
-     "was genocide; about 10,000 were killed.",
-     "scales"),
-    ("MIDDLE EAST", (176, 106, 0),
-     "Houthi strike hits Riyadh\u2019s PIF Tower",
-     "A missile damages Saudi Arabia\u2019s sovereign wealth fund HQ, "
-     "blowing out windows across seven floors.",
-     "tower"),
-    ("EUROPE \u00b7 WAR", (178, 34, 34),
-     "Kerch bridge rail hit a third time",
-     "Neptun missiles strike the rail section; train traffic halts "
-     "days after the road span collapsed.",
-     "bridge"),
-    ("TECHNOLOGY", (46, 125, 90),
-     "Anthropic debuts in record $81.3B IPO",
-     "Shares open at $111 on Nasdaq, 33% above the $83 price, in "
-     "the largest listing ever.",
-     "chip"),
-    ("SOUTH ASIA", (150, 60, 60),
-     "Bangladesh burns as lockdown bites",
-     "Yunus\u2019s ancestral home is torched and four people are "
-     "killed in Awami League lockdown violence.",
-     "flame"),
+    {
+        "kicker": "DIPLOMACY",
+        "accent": (37, 99, 235),
+        "headline": "TRUMP, XI AND PUTIN MEET IN SHENZHEN",
+        "body": "FIRST EVER US-CHINA-RUSSIA THREE-WAY SUMMIT AT APEC. "
+                "NUCLEAR RISKS, UKRAINE AND IRAN ON THE TABLE.",
+        "source": "REUTERS - AP - BBC",
+    },
+    {
+        "kicker": "JUSTICE",
+        "accent": (124, 58, 237),
+        "headline": "ICJ: MYANMAR COMMITTED GENOCIDE",
+        "body": "COURT RULES 9-6 OVER THE 2017 ROHINGYA CRACKDOWN. "
+                "ABOUT 10,000 KILLED.",
+        "source": "AP - REUTERS - BBC",
+    },
+    {
+        "kicker": "MIDDLE EAST",
+        "accent": (220, 38, 38),
+        "headline": "HOUTHI STRIKE HITS RIYADH TOWER",
+        "body": "MISSILE HITS THE PIF TOWER, HOME OF SAUDI ARABIA'S "
+                "SOVEREIGN WEALTH FUND. WINDOWS BLOWN OUT ACROSS "
+                "SEVEN FLOORS.",
+        "source": "REUTERS",
+    },
+    {
+        "kicker": "WAR IN EUROPE",
+        "accent": (217, 119, 6),
+        "headline": "UKRAINE HITS KERCH BRIDGE AGAIN",
+        "body": "THIRD STRIKE ON THE RAIL SECTION IN FOUR DAYS. "
+                "NEPTUN MISSILES HALT TRAIN TRAFFIC.",
+        "source": "AP",
+    },
+    {
+        "kicker": "TECHNOLOGY",
+        "accent": (5, 150, 105),
+        "headline": "ANTHROPIC'S RECORD $81.3B IPO",
+        "body": "NASDAQ DEBUT. SHARES OPEN AT $111, 33% ABOVE THE "
+                "$83 PRICE.",
+        "source": "TECHCRUNCH - REUTERS",
+    },
+    {
+        "kicker": "SOUTH ASIA",
+        "accent": (190, 24, 93),
+        "headline": "BANGLADESH BURNS",
+        "body": "AWAMI LEAGUE LOCKDOWN BITES. YUNUS'S ANCESTRAL HOME "
+                "TORCHED, FOUR KILLED, CLASHES IN 28 DISTRICTS.",
+        "source": "PTI - REUTERS",
+    },
 ]
 
 
-def icon(draw, kind, cx, cy, r, colour):
-    """Simple white glyph on a coloured disc."""
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=colour)
-    w = (255, 255, 255)
-    if kind == "bridge":
-        draw.line([cx - r + 8, cy + 6, cx + r - 8, cy + 6], fill=w, width=4)
-        draw.arc([cx - r + 8, cy - r + 12, cx - 4, cy + 10], 180, 360,
-                 fill=w, width=4)
-        draw.arc([cx + 4, cy - r + 12, cx + r - 8, cy + 10], 180, 360,
-                 fill=w, width=4)
-        draw.line([cx - r + 12, cy - r + 18, cx - r + 12, cy + 6],
-                  fill=w, width=3)
-        draw.line([cx + r - 12, cy - r + 18, cx + r - 12, cy + 6],
-                  fill=w, width=3)
-    elif kind == "flags":
-        for x in (cx - 16, cx - 2, cx + 12):
-            draw.line([x, cy - r + 14, x, cy + r - 12], fill=w, width=3)
-            draw.rectangle([x, cy - r + 14, x + 12, cy - r + 26], fill=w)
-    elif kind == "scales":
-        draw.line([cx, cy - r + 12, cx, cy + r - 12], fill=w, width=3)
-        draw.line([cx - r + 12, cy - r + 12, cx + r - 12, cy - r + 12],
-                  fill=w, width=3)
-        draw.polygon([(cx - r + 12, cy - 2), (cx - r + 2, cy - 2),
-                      (cx - r + 7, cy + 10)], fill=w)
-        draw.polygon([(cx + r - 12, cy - 2), (cx + r - 2, cy - 2),
-                      (cx + r - 7, cy + 10)], fill=w)
-        draw.line([cx - 8, cy + r - 12, cx + 8, cy + r - 12], fill=w, width=3)
-    elif kind == "tower":
-        draw.polygon([(cx - 10, cy + r - 12), (cx - 10, cy - 6),
-                      (cx, cy - r + 10), (cx + 10, cy - 6),
-                      (cx + 10, cy + r - 12)], fill=w)
-        draw.line([cx - 6, cy + 2, cx + 6, cy + 2], fill=colour, width=2)
-        draw.line([cx - 6, cy + 10, cx + 6, cy + 10], fill=colour, width=2)
-    elif kind == "flame":
-        draw.polygon([(cx, cy - r + 12), (cx + 12, cy - 2),
-                      (cx + 6, cy + 6), (cx + 14, cy + r - 12),
-                      (cx - 14, cy + r - 12), (cx - 6, cy + 6),
-                      (cx - 12, cy - 2)], fill=w)
-    elif kind == "chip":
-        draw.rectangle([cx - 14, cy - 14, cx + 14, cy + 14], outline=w,
-                       width=3)
-        draw.rectangle([cx - 6, cy - 6, cx + 6, cy + 6], fill=w)
-        for x in (cx - 8, cx, cx + 8):
-            draw.line([x, cy - 20, x, cy - 14], fill=w, width=3)
-            draw.line([x, cy + 14, x, cy + 20], fill=w, width=3)
-        for y in (cy - 8, cy, cy + 8):
-            draw.line([cx - 20, y, cx - 14, y], fill=w, width=3)
-            draw.line([cx + 14, y, cx + 20, y], fill=w, width=3)
+def render():
+    buf = new_canvas(WIDTH, HEIGHT, PAPER)
+    # Masthead: dark band, title, then the date in gold.
+    fill(buf, WIDTH, 0, 0, WIDTH, 168, NAVY)
+    draw_centred(buf, WIDTH, 30, "THE WORLD IN ONE DAY", WHITE, 4)
+    draw_centred(buf, WIDTH, 96, "THURSDAY, 19 NOVEMBER 2026", GOLD, 3)
+    fill(buf, WIDTH, 0, 168, WIDTH, 4, GOLD)
+    # Six cards: two columns, three rows.
+    margin = 24
+    gap = 16
+    top = 188
+    bottom = 976
+    card_w = (WIDTH - 2 * margin - gap) // 2
+    card_h = (bottom - top - 2 * gap) // 3
+    for i, story in enumerate(STORIES):
+        col = i % 2
+        row = i // 2
+        x = margin + col * (card_w + gap)
+        y = top + row * (card_h + gap)
+        fill(buf, WIDTH, x, y, card_w, card_h, CARD)
+        border(buf, WIDTH, x, y, card_w, card_h, LINE, 2)
+        fill(buf, WIDTH, x, y, card_w, 10, story["accent"])
+        draw_text(buf, WIDTH, x + 18, y + 26, story["kicker"],
+                  story["accent"], 1)
+        after_head = draw_wrapped(buf, WIDTH, x + 18, y + 52,
+                                  story["headline"], INK, 2,
+                                  (card_w - 36) // 12, 30)
+        draw_wrapped(buf, WIDTH, x + 18, after_head + 14, story["body"],
+                     INK, 1, (card_w - 36) // 6, 14)
+        draw_text(buf, WIDTH, x + 18, y + card_h - 30, story["source"],
+                  GREY, 1)
+    draw_centred(buf, WIDTH, 988,
+                 "SOURCES: REUTERS - AP - AFP - BBC - TECHCRUNCH - PTI",
+                 GREY, 1)
+    return buf
 
 
 def main():
-    img = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(img)
-
-    # --- masthead ---
-    d.rectangle([0, 0, W, 172], fill=NAVY)
-    d.line([36, 168, W - 36, 168], fill=GOLD, width=3)
-    f_name = font(SERIF_BOLD, 40)
-    f_kicker = font(SANS_BOLD, 22)
-    date_text = "THURSDAY, 19 NOVEMBER 2026"
-    date_size = 54
-    f_date = font(SANS_BOLD, date_size)
-    while d.textlength(date_text, font=f_date) > W - 2 * 36 and date_size > 28:
-        date_size -= 2
-        f_date = font(SANS_BOLD, date_size)
-    f_sub = font(SANS, 22)
-    d.text((36, 16), "THE WORLD IN ONE DAY", font=f_name, fill=(255, 255, 255))
-    d.text((W - 36 - d.textlength("No. 19", font=f_kicker), 26), "No. 19",
-           font=f_kicker, fill=GOLD)
-    d.text((36, 66), date_text, font=f_date, fill=GOLD)
-    d.text((36, 130), "Six stories that defined the day \u2014 as reported",
-           font=f_sub, fill=(190, 200, 220))
-
-    # --- story cards: 2 cols x 3 rows ---
-    margin, gutter = 36, 18
-    cw = (W - 2 * margin - gutter) // 2
-    ch = 244
-    top = 192
-    f_tag = font(SANS_BOLD, 19)
-    f_head = font(SANS_BOLD, 28)
-    f_body = font(SANS, 20)
-    for i, (tag, colour, head, body, ic) in enumerate(STORIES):
-        row, col = divmod(i, 2)
-        x0 = margin + col * (cw + gutter)
-        y0 = top + row * (ch + gutter)
-        d.rectangle([x0, y0, x0 + cw, y0 + ch], fill=CARD, outline=RULE,
-                    width=2)
-        d.rectangle([x0, y0, x0 + cw, y0 + 7], fill=colour)
-        icon(d, ic, x0 + cw - 42, y0 + 46, 29, colour)
-        d.text((x0 + 18, y0 + 20), tag, font=f_tag, fill=colour)
-        text_w = cw - 36 - 74  # leave room for the icon disc
-        y = y0 + 52
-        head_lines = wrap(d, head, f_head, text_w)[:2]
-        for ln in head_lines:
-            d.text((x0 + 18, y), ln, font=f_head, fill=INK)
-            y += 35
-        y += 4
-        body_lines = wrap(d, body, f_body, cw - 36)[:3]
-        for ln in body_lines:
-            d.text((x0 + 18, y), ln, font=f_body, fill=BODY_INK)
-            y += 27
-        if len(wrap(d, head, f_head, text_w)) > 2 or \
-                len(wrap(d, body, f_body, cw - 36)) > 3:
-            print("WARNING: text truncated in card", i, tag)
-
-    # --- footer ---
-    f_foot = font(SANS, 17)
-    d.text((36, 986),
-           "Sources: Reuters, AP, AFP, BBC, TechCrunch, PTI \u2014 as reported "
-           "on 19 November 2026.",
-           font=f_foot, fill=GREY)
-
-    img.save("entry.png", optimize=True)
-    print("wrote entry.png")
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "generated.png")
+    buf = render()
+    write_png(out, WIDTH, HEIGHT, buf)
+    print("wrote %s (%dx%d)" % (out, WIDTH, HEIGHT))
 
 
 if __name__ == "__main__":
